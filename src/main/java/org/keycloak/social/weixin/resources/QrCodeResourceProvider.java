@@ -7,8 +7,12 @@ import jakarta.ws.rs.core.Response;
 import lombok.SneakyThrows;
 import org.apache.commons.collections4.map.HashedMap;
 import org.jboss.logging.Logger;
+import org.keycloak.broker.oidc.OAuth2IdentityProviderConfig;
+import org.keycloak.models.IdentityProviderModel;
+import org.keycloak.models.IdentityProviderStorageProvider;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.services.resource.RealmResourceProvider;
+import org.keycloak.social.weixin.WeiXinIdentityProvider;
 import org.keycloak.social.weixin.cache.TicketStatusProvider;
 import org.w3c.dom.Document;
 import org.xml.sax.InputSource;
@@ -20,6 +24,7 @@ import java.util.Map;
 import java.util.Objects;
 
 import static org.keycloak.broker.oidc.AbstractOAuth2IdentityProvider.OAUTH2_PARAMETER_REDIRECT_URI;
+import static org.keycloak.social.weixin.helpers.WechatMpHelper.isWechatMpMessage;
 
 public class QrCodeResourceProvider implements RealmResourceProvider {
     private final KeycloakSession session;
@@ -51,7 +56,7 @@ public class QrCodeResourceProvider implements RealmResourceProvider {
 
     @GET
     @Path("mp-qr")
-    @Produces(MediaType.TEXT_HTML)
+    @Produces(MediaType.TEXT_HTML + ";charset=UTF-8")
     public Response mpQrUrl(@QueryParam("ticket") String ticket, @QueryParam("qr-code-url") String qrCodeUrl, @QueryParam("state") String state, @QueryParam(OAUTH2_PARAMETER_REDIRECT_URI) String redirectUri) {
         logger.info("展示一个 HTML 页面，该页面使用 React 展示一个组件，它调用一个后端 API，得到一个带参二维码 URL，并将该 URL 作为 img 的 src 属性值");
 
@@ -65,15 +70,39 @@ public class QrCodeResourceProvider implements RealmResourceProvider {
                 <!DOCTYPE html>
                 <html>
                 <head>
+                    <meta charset="UTF-8">
                     <title>QR Code Page</title>
+                    <style>
+                        body {
+                            display: flex;
+                            justify-content: center;
+                            align-items: center;
+                            min-height: 100vh;
+                            margin: 0;
+                            font-family: Arial, sans-serif;
+                        }
+                        #qrCodeContainer {
+                            text-align: center;
+                        }
+                        img {
+                            max-width: 300px;
+                            height: auto;
+                        }
+                        .status-text {
+                            margin-top: 20px;
+                            font-size: 16px;
+                            color: #666;
+                        }
+                        .status-text.scanned {
+                            color: #4CAF50;
+                        }
+                    </style>
                 </head>
                 <body>
-                    <p>请使用微信扫描下方二维码：<span style="float: right; color: red;"><a href="https://taro.jefftian.dev/pages/subpages/github/readme?name=keycloak-services-social-weixin" target="_blank" rel="noopener noreferrer">关于此插件</a></span></p>
                     <div id="qrCodeContainer">
+                        <p>请使用微信扫描下方二维码</p>
                         <img src="%s" alt="%s">
-                
-                        <p></p>
-                        <p><button id="login-by-username-password" onclick="keycloak.login({ idpHint: 'username', redirectUri: '%s' });" type="button">使用密码登录</button></p>
+                        <p id="statusText" class="status-text">等待扫码...</p>
                     </div>
                     <script type="text/javascript">
                         async function fetchQrScanStatus() {
@@ -84,11 +113,19 @@ public class QrCodeResourceProvider implements RealmResourceProvider {
                             })
                 
                             const {status, openid} = await res.json()
+                            const statusText = document.getElementById('statusText')
                 
-                            if (openid) {
+                            if (status === 'scanned') {
+                                statusText.textContent = '已扫码，正在登录...'
+                                statusText.classList.add('scanned')
                                 window.location.href = `%s?openid=${openid}&state=%s`
-                            } else {
+                            } else if (status === 'not_scanned') {
+                                statusText.textContent = '等待扫码...'
                                 setTimeout(fetchQrScanStatus, 1000)
+                            } else if (status === 'expired') {
+                                statusText.textContent = '二维码已过期，请重新扫码二维码'
+                            } else {
+                                statusText.textContent = '未知错误，请重新扫码二维码'
                             }
                         }
                 
@@ -109,7 +146,7 @@ public class QrCodeResourceProvider implements RealmResourceProvider {
                 </html>
                 """;
 
-        String htmlContent = String.format(template, qrCodeUrl, ticket, accountRedirectUri, ticket, redirectUri, state, host, realmName, accountRedirectUri);
+        String htmlContent = String.format(template, qrCodeUrl, ticket, ticket, redirectUri, state, host, realmName, accountRedirectUri);
 
         // 返回包含HTML内容的响应
         return Response.ok(htmlContent, MediaType.TEXT_HTML_TYPE).build();
@@ -162,7 +199,7 @@ public class QrCodeResourceProvider implements RealmResourceProvider {
     @Consumes(MediaType.APPLICATION_XML)
     @Produces(MediaType.APPLICATION_JSON)
     public Response mpQrScanStatusScanned(String xmlData) {
-        logger.info("接收到微信服务器发来的事件： " + xmlData);
+        logger.info("查询二维码状态： " + xmlData);
 
         DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
         DocumentBuilder builder = factory.newDocumentBuilder();
@@ -198,8 +235,39 @@ public class QrCodeResourceProvider implements RealmResourceProvider {
     @Path("message")
     @Consumes(MediaType.WILDCARD)
     @Produces(MediaType.APPLICATION_JSON)
-    public Response message(String xmlData) {
-        logger.info("接收到微信服务器发来的事件： " + xmlData);
+    public Response message(
+            @QueryParam("signature") String signature,
+            @QueryParam("timestamp") String timestamp,
+            @QueryParam("nonce") String nonce,
+            String xmlData
+    ) {
+        logger.info("接收微信消息和事件" + xmlData);
+        logger.info("查询参数: signature=" + signature + ", timestamp=" + timestamp + ", nonce=" + nonce);
+
+        // 获取配置的WECHAT_MP_APP_TOKEN
+        IdentityProviderStorageProvider idpStorage = session.getProvider(IdentityProviderStorageProvider.class);
+        IdentityProviderModel idpModel = idpStorage.getByAlias("weixin");
+        if (idpModel == null) {
+            return Response.status(Response.Status.NOT_FOUND)
+                    .entity("Identity Provider not found")
+                    .build();
+        }
+        OAuth2IdentityProviderConfig config = new OAuth2IdentityProviderConfig(idpModel);
+        String token = config.getConfig().get(WeiXinIdentityProvider.WECHAT_MP_APP_TOKEN);
+
+        if (token != null && !token.isEmpty()) {
+            // 使用配置的token进行验证
+            if (!isWechatMpMessage(token, signature, timestamp, nonce)) {
+                logger.warn("签名验证失败");
+                return Response.status(Response.Status.UNAUTHORIZED).entity("Invalid signature").build();
+            }
+        } else {
+            // 如果没有配置token，使用默认的验证方式
+            if (!isWechatMpMessage(signature, timestamp, nonce)) {
+                logger.warn("签名验证失败");
+                return Response.status(Response.Status.UNAUTHORIZED).entity("Invalid signature").build();
+            }
+        }
 
         DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
         DocumentBuilder builder = factory.newDocumentBuilder();
@@ -220,8 +288,8 @@ public class QrCodeResourceProvider implements RealmResourceProvider {
         var ticketSaved = this.ticketStatusProvider.getTicketStatus(xmlTicket);
         if (ticketSaved == null) {
             logger.warn(String.format("ticket is not found, {%s}", xmlTicket));
-            return Response.ok("success").build();
-//            return Response.ok(Map.of("status", "not_scanned")).build();
+//            return Response.ok("success").build();
+            return Response.ok(Map.of("status", "ticket_not_found")).build();
         }
 
         ticketSaved.setStatus("scanned");
@@ -237,8 +305,39 @@ public class QrCodeResourceProvider implements RealmResourceProvider {
     @GET
     @Path("message")
     @Produces(MediaType.APPLICATION_JSON)
-    public Response message(@QueryParam("echostr") String echostr, String xmlData) {
+    public Response message(
+            @QueryParam("echostr") String echostr, @QueryParam("signature") String signature,
+            @QueryParam("timestamp") String timestamp,
+            @QueryParam("nonce") String nonce,
+            String xmlData) {
+
         logger.info("接收到微信服务器发来的事件： " + xmlData);
+        logger.info("查询参数: signature=" + signature + ", timestamp=" + timestamp + ", nonce=" + nonce);
+
+        // 获取配置的WECHAT_MP_APP_TOKEN
+        IdentityProviderStorageProvider idpStorage = session.getProvider(IdentityProviderStorageProvider.class);
+        IdentityProviderModel idpModel = idpStorage.getByAlias("weixin");
+        if (idpModel == null) {
+            return Response.status(Response.Status.NOT_FOUND)
+                    .entity("Identity Provider not found")
+                    .build();
+        }
+        OAuth2IdentityProviderConfig config = new OAuth2IdentityProviderConfig(idpModel);
+        String token = config.getConfig().get(WeiXinIdentityProvider.WECHAT_MP_APP_TOKEN);
+
+        if (token != null && !token.isEmpty()) {
+            // 使用配置的token进行验证
+            if (!isWechatMpMessage(token, signature, timestamp, nonce)) {
+                logger.warn("签名验证失败");
+                return Response.status(Response.Status.UNAUTHORIZED).entity("Invalid signature").build();
+            }
+        } else {
+            // 如果没有配置token，使用默认的验证方式
+            if (!isWechatMpMessage(signature, timestamp, nonce)) {
+                logger.warn("签名验证失败");
+                return Response.status(Response.Status.UNAUTHORIZED).entity("Invalid signature").build();
+            }
+        }
 
         return Response.ok(echostr).build();
     }

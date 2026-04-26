@@ -1,5 +1,10 @@
 package org.keycloak.social.weixin.helpers;
 
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
+
 import org.keycloak.broker.provider.BrokeredIdentityContext;
 import org.keycloak.broker.provider.util.IdentityBrokerState;
 import org.keycloak.models.*;
@@ -9,12 +14,9 @@ import org.keycloak.social.weixin.AuthenticatedWMPSession;
 import org.keycloak.social.weixin.WMPUserSessionModel;
 import org.keycloak.social.weixin.WeiXinIdentityBrokerService;
 
-import java.util.*;
-import java.util.stream.Stream;
-
 public class WMPHelper {
-    public static String createStateForWMP(String clientId, String tabId) {
-        return IdentityBrokerState.decoded("wmp", clientId, clientId, tabId).getEncoded();
+    public static String createStateForWMP(String clientId, String tabId, String clientData) {
+        return IdentityBrokerState.decoded("wmp", clientId, clientId, tabId, clientData).getEncoded();
     }
 
     public static UserSessionModel getUserSessionModel(BrokeredIdentityContext context, UserModel federatedUser, AuthenticationSessionModel authSession) {
